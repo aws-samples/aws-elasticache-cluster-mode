@@ -1,0 +1,7 @@
+source 'https://rubygems.org'
+
+gem "redis", "~> 4.1"
+
+gem "faker", "~> 1.9"
+
+gem "hiredis", "~> 0.6.3"

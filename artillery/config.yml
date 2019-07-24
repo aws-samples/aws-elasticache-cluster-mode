@@ -1,0 +1,19 @@
+config:
+  target: 'http://internal-aws-e-LoadB-1BMCTPB4DLADI-50923873.us-east-2.elb.amazonaws.com'
+  phases:
+    - duration: 1200
+      arrivalRate: 20
+      rampTo: 150
+      name: "Warm up"
+    - duration: 600
+      arrivalRate: 50
+      rampTo: 300
+      name: "Higher load"
+    - duration: 1200
+      arrivalRate: 20
+      rampTo: 150
+      name: "Cool Down"
+scenarios:
+  - flow:
+    - get:
+        url: '/'

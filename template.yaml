@@ -1,0 +1,707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS ElatiCache for Redis - Cluster Mode Demonstration
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-elasticache-cluster-mode
+
+  ElasticacheInstanceClass:
+    Type: String
+    Default: cache.r5.large #cache.t2.micro
+
+Globals:
+  Function:
+    Runtime: ruby2.5
+    Handler: app.handler
+    MemorySize: 1024
+    Timeout: 15
+    Tracing: Active
+    Tags:
+      Project: !Ref ProjectName
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    Private1:
+      CIDR: '10.0.0.0/24'
+    Private2:
+      CIDR: '10.0.1.0/24'
+    Lambda1:
+      CIDR: '10.0.2.0/24'
+    Lambda2:
+      CIDR: '10.0.3.0/24'
+    Public1:
+      CIDR: '10.0.4.0/24'
+
+Resources:
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticache-replicationgroup.html
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      AutoMinorVersionUpgrade: true
+      # enable Cluster Mode
+      CacheParameterGroupName: default.redis5.0.cluster.on
+      CacheNodeType: !Ref ElasticacheInstanceClass
+      CacheSubnetGroupName:  !Ref RedisSubnetGroup
+      Engine: redis
+      EngineVersion: 5.0.4
+      NumNodeGroups: 1
+      Port: 6379
+      ReplicasPerNodeGroup: 1
+      ReplicationGroupDescription: Sample Redis group for scaling
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+  
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable Redis access 
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #
+  # Test API
+  #
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >
+        Sets and gets data from ElastiCache cluster, recording response
+        times in CloudWatch.
+      CodeUri: test/
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          ELASTICACHE_ENDPOINT: !GetAtt RedisCluster.ConfigurationEndPoint.Address
+          ELASTICACHE_PORT: !GetAtt RedisCluster.ConfigurationEndPoint.Port
+      Tags:
+        Project: !Ref ProjectName
+  
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable Redis access
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - !Ref LambdaSubnet1
+        - !Ref LambdaSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: TestFunctionInvokePermission
+    Properties:
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt TestFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  TestFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TestFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: elasticloadbalancing.amazonaws.com
+
+  #
+  # Fargate
+  #
+  ArtilleryRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-artillery"
+
+  ArtilleryCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-artillery"
+
+  ArtilleryTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-task"
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: 3GB
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ProjectName}-artillery"
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ArtilleryRepository}:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ArtillerySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable Redis access
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-task"
+
+  #
+  # Networking
+  #
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select: 
+        - 0
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Private1', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select: 
+        - 1
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Private2', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-2"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select: 
+        - 1
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Public1', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-1"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select: 
+        - 0
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Lambda1', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-subnet-1"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select: 
+        - 1
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Lambda2', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-subnet-2"
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGatewayAttachment:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachement
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayAttachment.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteTable1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  #
+  # CloudWatch
+  #
+  CloudWatchDashboard:  
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub |
+        {
+          "start": "-PT1H",
+          "periodOverride": "inherit",
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# Redis Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 1,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "BytesUsedForCache", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "Bytes Used for Cache by Node"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 1,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "NewConnections", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ],
+                  [ ".", "CurrConnections", ".", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "New and Current Connections by Node"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 1,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "CurrItems", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "Current Items by Node"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "CPUUtilization", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "CPU Utilization by Node"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "Evictions", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "Evictions by Node"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 7,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "SwapUsage", "CacheClusterId", "${RedisCluster}-0001-001" ],
+                  [ "...", "${RedisCluster}-0002-001" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 30,
+                "title": "Swap Usage by Node"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0,
+              "y": 13,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 14,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${TestFunction}", "Resource", "${TestFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "SampleCount",
+                "period": 30,
+                "title": "Invocations"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 14,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "${TestFunction}", "Resource", "${TestFunction}" ],
+                  [ ".", "Errors", "..." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 30,
+                "title": "Throttles & Errors"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0,
+              "y": 21,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# ALB Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 22,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "NewConnectionCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ ".", "RequestCount", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 30,
+                "title": "Connections & Requests"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 22,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 30,
+                "title": "Errors"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0,
+              "y": 29,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# Latency Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 30,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${TestFunction}' | filter type = \"ECL\"\n| stats count(requestId), avg(write), max(write), min(write), pct(write, 50), pct(write, 90), pct(write, 95) by bin(30s)",
+                "region": "${AWS::Region}",
+                "title": "Write Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 36,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${TestFunction}' | filter type = \"ECL\"\n| stats count(requestId), avg(read), max(read), min(read), pct(read, 50), pct(read, 90), pct(read, 95) by bin(30s)",
+                "region": "${AWS::Region}",
+                "title": "Read Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 42,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${TestFunction}' | filter type = \"ECL\"\n| stats count(requestId), avg(read), max(connection), min(connection), pct(connection, 50), pct(connection, 90), pct(connection, 95) by bin(30s)",
+                "region": "${AWS::Region}",
+                "title": "Connection Metrics"
+              }
+            }
+          ]
+        }
+      
+
+Outputs:
+  RedisCluster:
+    Description: Name of Redis Cluster
+    Value: !Ref RedisCluster
+
+  RedisPrimaryEndpoint:
+    Description: Redis Primary Endpoint
+    Value: !GetAtt RedisCluster.ConfigurationEndPoint.Address
+
+  LoadBalancerDns:
+    Description: DNS name for Load Balancer
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+
+  ArtilleryRepository:
+    Description: ECR Repository for Artillery image
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ArtilleryRepository}
+
+  CloudWatchDashboard:
+    Description: Name of CloudWatch Dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CloudWatchDashboard}"
+
+  PrivateSubnets:
+    Description: Array of private subnets
+    Value: !Sub "${PrivateSubnet1},${PrivateSubnet2}"
+  
+  ArtillerySecurityGroup:
+    Description: Security Group for Artillery test harness
+    Value: !Ref ArtillerySecurityGroup
+
+  ArtilleryTaskDefinition:
+    Description: Task definition for Artillery
+    Value: !Ref ArtilleryTaskDefinition
+
+  ArtilleryCluster:
+    Description: ECS Cluster for Artillery
+    Value: !Ref ArtilleryCluster
